@@ -19,13 +19,6 @@ interface RuleRow {
   current_price: string;
 }
 
-/**
- * Core agent loop. For each active rule, checks whether the current price
- * satisfies the rule. If so, asks Claude to produce a short, human-readable
- * justification and confirm the action -- this is the "agentic" part: the
- * agent reasons about the decision rather than a bare if-statement, and the
- * reasoning is what gets shown in the live decision log during the demo.
- */
 export async function runAgentCycle() {
   const { rows: rules } = await pool.query<RuleRow>(
     `SELECT wr.id, wr.product_id, wr.target_price, wr.budget_cap, wr.auto_buy, wr.status,
@@ -41,11 +34,9 @@ export async function runAgentCycle() {
     const budgetCap = parseFloat(rule.budget_cap);
 
     if (currentPrice > targetPrice) {
-      continue; // no action needed this tick, don't spam decisions
+      continue;
     }
 
-    // Safety guardrail: never act above the budget cap, regardless of what
-    // the model says. This is enforced in code, not left to the LLM.
     const withinBudget = currentPrice <= budgetCap;
 
     const decision = await getAgentDecision({
@@ -71,6 +62,8 @@ export async function runAgentCycle() {
   }
 }
 
+const USE_LLM = process.env.USE_LLM !== "false";
+
 async function getAgentDecision(params: {
   productName: string;
   currentPrice: number;
@@ -82,12 +75,17 @@ async function getAgentDecision(params: {
   const { productName, currentPrice, targetPrice, budgetCap, autoBuy, withinBudget } =
     params;
 
-  // Hard guardrail enforced before the model is even asked -- code, not a prompt.
   if (!withinBudget) {
     return {
       action: "skip",
       reasoning: `Price of $${currentPrice} is under the target but exceeds the hard budget cap of $${budgetCap}. Skipping to respect the user's spending limit.`,
     };
+  }
+
+  const action: "purchase" | "notify" = autoBuy ? "purchase" : "notify";
+
+  if (!USE_LLM) {
+    return { action, reasoning: localReasoning({ productName, currentPrice, targetPrice, budgetCap, action }) };
   }
 
   const prompt = `You are a shopping agent monitoring prices on behalf of a user.
@@ -106,25 +104,47 @@ Respond in this exact format, nothing else:
 ACTION: <purchase|notify>
 REASONING: <one or two sentences explaining the decision to the user, mention the price, target, and savings>`;
 
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 200,
-    messages: [{ role: "user", content: prompt }],
-  });
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 200,
+      messages: [{ role: "user", content: prompt }],
+    });
 
-  const text = response.content
-    .filter((block) => block.type === "text")
-    .map((block) => (block as { type: "text"; text: string }).text)
-    .join("\n");
+    const text = response.content
+      .filter((block) => block.type === "text")
+      .map((block) => (block as { type: "text"; text: string }).text)
+      .join("\n");
 
-  const actionMatch = text.match(/ACTION:\s*(purchase|notify)/i);
-  const reasoningMatch = text.match(/REASONING:\s*(.+)/is);
+    const actionMatch = text.match(/ACTION:\s*(purchase|notify)/i);
+    const reasoningMatch = text.match(/REASONING:\s*(.+)/is);
 
-  const action = (actionMatch?.[1]?.toLowerCase() as "purchase" | "notify") ??
-    (autoBuy ? "purchase" : "notify");
-  const reasoning =
-    reasoningMatch?.[1]?.trim() ??
-    `Price hit $${currentPrice}, meeting the $${targetPrice} target within the $${budgetCap} budget.`;
+    const parsedAction = (actionMatch?.[1]?.toLowerCase() as "purchase" | "notify") ?? action;
+    const reasoning =
+      reasoningMatch?.[1]?.trim() ??
+      localReasoning({ productName, currentPrice, targetPrice, budgetCap, action: parsedAction });
 
-  return { action, reasoning };
+    return { action: parsedAction, reasoning };
+  } catch (err) {
+    console.warn("Claude API call failed, using local reasoning fallback:", (err as Error).message);
+    return { action, reasoning: localReasoning({ productName, currentPrice, targetPrice, budgetCap, action }) };
+  }
+}
+
+function localReasoning(params: {
+  productName: string;
+  currentPrice: number;
+  targetPrice: number;
+  budgetCap: number;
+  action: "purchase" | "notify";
+}): string {
+  const { productName, currentPrice, targetPrice, budgetCap } = params;
+  const savings = (targetPrice - currentPrice).toFixed(2);
+  const savingsPhrase =
+    Number(savings) > 0 ? ` — $${savings} under your target` : " — right at your target";
+
+  if (params.action === "purchase") {
+    return `${productName} hit $${currentPrice}${savingsPhrase} and stayed within the $${budgetCap} budget cap, so I went ahead and purchased it on your behalf.`;
+  }
+  return `${productName} hit $${currentPrice}${savingsPhrase}. Auto-buy is off for this rule, so I'm notifying you instead of purchasing — it's within your $${budgetCap} budget if you want to act on it.`;
 }
